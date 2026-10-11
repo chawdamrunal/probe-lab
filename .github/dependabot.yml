@@ -4,7 +4,7 @@ updates:
     directory: "/"
     schedule:
       interval: "cron"
-      cronjob: "10 17 * * *"
+      cronjob: "25 17 * * *"
       timezone: "UTC"
   - package-ecosystem: "npm"
     directory: "/"
