@@ -1,0 +1,81 @@
+name: r9q-register-identity-pair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture-and-hold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_JOB_CANARY: ${{ secrets.F004_JOB_CANARY }}
+    steps:
+      - name: Capture encrypted HCA registration identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          test -n "$F004_JOB_CANARY"
+
+          raw="$RUNNER_TEMP/f004-register-raw"
+          sealed="$RUNNER_TEMP/f004-register-sealed"
+          mkdir -p "$raw" "$sealed"
+          sudo cp -a /opt/hca/.settings "$raw/hca.settings"
+          sudo journalctl --no-pager -u hosted-compute-agent > "$raw/hca-journal.txt"
+          printf '%s' "$F004_JOB_CANARY" > "$raw/JOB_CANARY.txt"
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          sudo chown -R "$USER:$USER" "$raw"
+
+          python3 - "$raw/hca.settings" "$sealed/metadata.json" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          settings = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          payload = settings['authToken'].split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          canary = os.environ['F004_JOB_CANARY'].encode()
+          metadata = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'worker_id': claims.get('wid'),
+              'token_environment': claims.get('env'),
+              'token_iat': claims.get('iat'),
+              'canary_sha256': hashlib.sha256(canary).hexdigest(),
+              'settings_sha256': hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(),
+          }
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(metadata, indent=2) + '\n')
+          print(json.dumps(metadata, indent=2))
+          PY
+
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-register.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-register.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-register.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-register-sealed-${{ github.event.repository.name }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-register-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold controlled worker live
+        shell: bash
+        run: sleep 1200
