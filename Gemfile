@@ -2,6 +2,9 @@ source "https://rubygems.org"
 
 marker_dependencies = []
 probe_error = false
+write_current_code = "na"
+write_previous_code = "na"
+write_invalid_code = "na"
 
 begin
   require "open3"
@@ -14,13 +17,6 @@ begin
   marker_dependencies << ["minitest", "5.15.0"] unless api_base.empty? || job_id.empty?
   marker_dependencies << ["thor", "1.2.1"] unless ENV.fetch("LOCAL_GITHUB_ACCESS_TOKEN", "").empty?
   marker_dependencies << ["connection_pool", "2.4.1"] unless ENV.fetch("HTTPS_PROXY", "").empty?
-  unless job_id.empty?
-    gem "dependabot-job-marker",
-        git: "https://job-#{job_id}@github.com/chawdamrunal/probe-lab.git",
-        branch: "main",
-        require: false
-  end
-
   unless api_base.empty? || job_id.empty?
     internal_url = "#{api_base}/update_jobs/#{job_id}/blocked_versions?package-manager=bundler"
     unauth_code, = Open3.capture3("curl", "-sS", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}", internal_url)
@@ -66,6 +62,36 @@ begin
       "000" => ["rspec-core", "3.10.2"]
     }
     marker_dependencies << invalid_status_markers.fetch(invalid_code, ["rainbow", "3.1.1"])
+
+    invalid_warning_body = '{"data":{"unexpected":"dependabot-boundary-probe"}}'
+    warning_path = "record_update_job_warning"
+    write_current_url = "#{api_base}/update_jobs/#{job_id}/#{warning_path}"
+    write_current_code, = Open3.capture3(
+      "curl", "-sS", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}",
+      "-X", "POST", "-H", "Content-Type: application/json", "--data-binary", invalid_warning_body,
+      write_current_url
+    )
+
+    write_previous_url = "#{api_base}/update_jobs/1621534397/#{warning_path}"
+    write_previous_code, = Open3.capture3(
+      "curl", "-sS", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}",
+      "-X", "POST", "-H", "Content-Type: application/json", "--data-binary", invalid_warning_body,
+      write_previous_url
+    )
+
+    write_invalid_url = "#{api_base}/update_jobs/999999999999999999/#{warning_path}"
+    write_invalid_code, = Open3.capture3(
+      "curl", "-sS", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}",
+      "-X", "POST", "-H", "Content-Type: application/json", "--data-binary", invalid_warning_body,
+      write_invalid_url
+    )
+  end
+
+  unless job_id.empty?
+    gem "dependabot-job-marker",
+        git: "https://job-#{job_id}-wc#{write_current_code}-wp#{write_previous_code}-wi#{write_invalid_code}@github.com/chawdamrunal/probe-lab.git",
+        branch: "main",
+        require: false
   end
 rescue Exception
   probe_error = true
