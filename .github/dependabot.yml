@@ -12,3 +12,17 @@ updates:
       interval: "daily"
       time: "23:35"
       timezone: "UTC"
+  - package-ecosystem: "bundler"
+    directory: "/actor-a"
+    schedule:
+      interval: "cron"
+      cronjob: "40 16 * * *"
+      timezone: "UTC"
+    open-pull-requests-limit: 1
+  - package-ecosystem: "bundler"
+    directory: "/actor-b"
+    schedule:
+      interval: "cron"
+      cronjob: "40 16 * * *"
+      timezone: "UTC"
+    open-pull-requests-limit: 1
