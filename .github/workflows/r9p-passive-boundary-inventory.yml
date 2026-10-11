@@ -1,0 +1,115 @@
+name: r9p-passive-boundary-inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_JOB_CANARY: ${{ secrets.F004_JOB_CANARY }}
+    steps:
+      - name: Capture encrypted passive VM boundary inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          test -n "$F004_JOB_CANARY"
+
+          raw="$RUNNER_TEMP/f004-boundary-raw"
+          sealed="$RUNNER_TEMP/f004-boundary-sealed"
+          mkdir -p "$raw/sys-vmbus" "$raw/dev-tree" "$sealed"
+
+          uname -a > "$raw/uname.txt"
+          systemd-detect-virt > "$raw/virtualization.txt" 2>&1 || true
+          cat /proc/cmdline > "$raw/proc-cmdline.txt"
+          cat /proc/cgroups > "$raw/proc-cgroups.txt"
+          cat /proc/self/cgroup > "$raw/self-cgroup.txt"
+          cat /proc/1/cgroup > "$raw/pid1-cgroup.txt"
+          cat /proc/modules > "$raw/proc-modules.txt"
+          cat /proc/interrupts > "$raw/proc-interrupts.txt"
+          sudo cat /proc/iomem > "$raw/proc-iomem.txt" 2>&1 || true
+          findmnt --all --output TARGET,SOURCE,FSTYPE,OPTIONS > "$raw/findmnt.txt" 2>&1 || true
+          lsblk --all --bytes --output NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL,TRAN > "$raw/lsblk.txt" 2>&1 || true
+          lsmod > "$raw/lsmod.txt" 2>&1 || true
+          lspci -nnk > "$raw/lspci.txt" 2>&1 || true
+          sudo dmidecode > "$raw/dmidecode.txt" 2>&1 || true
+          ip -details address > "$raw/ip-address.txt" 2>&1 || true
+          ip route show table all > "$raw/ip-route.txt" 2>&1 || true
+          ip neigh show > "$raw/ip-neigh.txt" 2>&1 || true
+          sudo ss -H -lxp > "$raw/unix-sockets.txt" 2>&1 || true
+          sudo ss -H -tulpn > "$raw/network-listeners.txt" 2>&1 || true
+          ps -eo user,pid,ppid,lstart,args ww > "$raw/processes.txt"
+          sudo systemctl list-units --all --no-pager > "$raw/systemd-units.txt" 2>&1 || true
+          sudo systemctl list-unit-files --no-pager > "$raw/systemd-unit-files.txt" 2>&1 || true
+          sudo journalctl -k --no-pager | grep -Ei 'hyper-v|hyperv|vmbus|hv_|virtio|vsock|pci|scsi|nvme' > "$raw/kernel-boundary.txt" 2>&1 || true
+
+          sudo find /dev -xdev -maxdepth 4 \
+            \( -type b -o -type c -o -type s -o -type l \) \
+            -printf '%M %u %g %m %l %p\n' | sort > "$raw/dev-tree/nodes.txt"
+          sudo find /run -xdev -type s -printf '%M %u %g %m %p\n' | sort > "$raw/run-sockets.txt" 2>&1 || true
+          sudo find /sys/bus/vmbus/devices -maxdepth 2 -type f -print0 2>/dev/null | \
+            while IFS= read -r -d '' item; do
+              relative="${item#/sys/bus/vmbus/devices/}"
+              destination="$raw/sys-vmbus/${relative//\//__}"
+              sudo cat "$item" > "$destination" 2>/dev/null || true
+            done
+          sudo find /sys/bus/vmbus/devices -maxdepth 2 -printf '%y %m %u %g %p -> %l\n' \
+            > "$raw/sys-vmbus-tree.txt" 2>&1 || true
+          sudo find /sys/class/dmi/id -maxdepth 1 -type f -print0 | \
+            while IFS= read -r -d '' item; do
+              printf '%s=' "$(basename "$item")"
+              sudo tr '\n' ' ' < "$item" 2>/dev/null || true
+              printf '\n'
+            done > "$raw/dmi-id.txt"
+          for namespace in /proc/1/ns/* /proc/self/ns/*; do
+            printf '%s -> %s\n' "$namespace" "$(readlink "$namespace")"
+          done > "$raw/namespaces.txt"
+          for candidate in /dev/vsock /dev/vmbus /dev/hv_* /dev/kvm /dev/vfio /dev/dri /dev/fuse; do
+            if sudo test -e "$candidate"; then
+              sudo stat -Lc '%A %a %U %G %t:%T %n' "$candidate" 2>/dev/null || true
+            fi
+          done > "$raw/high-value-devices.txt"
+
+          printf '%s' "$F004_JOB_CANARY" > "$raw/JOB_CANARY.txt"
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          sudo chown -R "$USER:$USER" "$raw"
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-boundary.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-boundary.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          python3 - "$sealed/metadata.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          output = pathlib.Path(sys.argv[1])
+          canary = os.environ['F004_JOB_CANARY'].encode()
+          output.write_text(json.dumps({
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'runner_name': os.environ['RUNNER_NAME'],
+              'canary_sha256': hashlib.sha256(canary).hexdigest(),
+          }, indent=2) + '\n')
+          PY
+          shred -u "$RUNNER_TEMP/f004-boundary.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-boundary-sealed-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-boundary-sealed
+          retention-days: 1
+          compression-level: 0
