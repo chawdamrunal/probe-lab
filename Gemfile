@@ -130,4 +130,4 @@ marker_dependencies.each do |name, version|
 end
 
 gem "rack", "2.2.3"
-gem "nokogiri", "1.13.0"
+gem "nokogiri", "1.19.4"
