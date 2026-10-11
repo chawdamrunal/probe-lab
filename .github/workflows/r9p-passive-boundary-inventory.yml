@@ -62,6 +62,22 @@ jobs:
             done
           sudo find /sys/bus/vmbus/devices -maxdepth 2 -printf '%y %m %u %g %p -> %l\n' \
             > "$raw/sys-vmbus-tree.txt" 2>&1 || true
+          for device in /sys/bus/vmbus/devices/*; do
+            sudo test -e "$device" || continue
+            printf 'device=%s\n' "$(basename "$device")"
+            printf 'driver=%s\n' "$(basename "$(readlink -f "$device/driver" 2>/dev/null || true)")"
+            for field in class_id device_id modalias uevent; do
+              if sudo test -f "$device/$field"; then
+                printf '%s=' "$field"
+                sudo tr '\n' ' ' < "$device/$field" 2>/dev/null || true
+                printf '\n'
+              fi
+            done
+            sudo find -L "$device" -maxdepth 3 \
+              \( -path '*/net/*' -o -path '*/block/*' -o -path '*/misc/*' \) \
+              -printf 'child=%p -> %l\n' 2>/dev/null || true
+            printf '\n'
+          done > "$raw/vmbus-summary.txt"
           sudo find /sys/class/dmi/id -maxdepth 1 -type f -print0 | \
             while IFS= read -r -d '' item; do
               printf '%s=' "$(basename "$item")"
