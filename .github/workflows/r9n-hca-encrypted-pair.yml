@@ -35,7 +35,7 @@ jobs:
           sudo systemctl cat hosted-compute-agent > "$raw/hca-systemd-unit.txt" 2>&1 || true
           sudo systemctl show hosted-compute-agent > "$raw/hca-systemd-properties.txt" 2>&1 || true
           sudo journalctl --no-pager -u hosted-compute-agent > "$raw/hca-journal.txt" 2>&1 || true
-          ps -eo user,pid,ppid,lstart,args --ww > "$raw/processes.txt"
+          ps -eo user,pid,ppid,lstart,args ww > "$raw/processes.txt"
           sudo ss -tpn > "$raw/tcp-connections.txt" 2>&1 || true
 
           while IFS= read -r -d '' source_file; do
